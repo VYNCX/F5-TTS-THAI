@@ -17,7 +17,7 @@ Text-to-Speech (TTS) ภาษาไทย — เครื่องมือส
 # การติดตั้ง
 ก่อนเริ่มใช้งาน ต้องติดตั้ง:
  - Python (แนะนำเวอร์ชัน 3.10 ขึ้นไป)
- - [CUDA](https://developer.nvidia.com/cuda-downloads) แนะนำ CUDA version 11.8
+ - [CUDA](https://developer.nvidia.com/cuda-downloads) แนะนำ CUDA version 12.8
  - [eSpeak NG](https://github.com/espeak-ng/espeak-ng)
 ```sh
 git clone https://github.com/VYNCX/F5-TTS-THAI.git
@@ -27,7 +27,7 @@ call venv/scripts/activate
 pip install git+https://github.com/VYNCX/F5-TTS-THAI.git
 
 #จำเป็นต้องติดตั้งเพื่อใช้งานได้มีประสิทธิภาพกับ GPU
-pip install torch==2.3.0+cu118 torchaudio==2.3.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+pip install torch==2.7.0+cu128 torchaudio==2.7.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
 ```
 หรือ รันไฟล์ `install.bat` เพื่อติดตั้ง
 
