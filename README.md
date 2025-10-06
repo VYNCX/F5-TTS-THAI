@@ -18,7 +18,6 @@ Text-to-Speech (TTS) ภาษาไทย — เครื่องมือส
 ก่อนเริ่มใช้งาน ต้องติดตั้ง:
  - Python (แนะนำเวอร์ชัน 3.10 ขึ้นไป)
  - [CUDA](https://developer.nvidia.com/cuda-downloads) แนะนำ CUDA version 11.8
- - [eSpeak NG](https://github.com/espeak-ng/espeak-ng)
 ```sh
 git clone https://github.com/VYNCX/F5-TTS-THAI.git
 cd F5-TTS-THAI
@@ -94,6 +93,7 @@ https://github.com/user-attachments/assets/06d6e94b-5f83-4d69-99d1-ad19caa9792b
 # อ้างอิง
 
 - [F5-TTS](https://github.com/SWivid/F5-TTS)
+
 
 
 
