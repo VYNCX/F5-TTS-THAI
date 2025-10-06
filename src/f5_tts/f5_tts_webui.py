@@ -23,8 +23,6 @@ from f5_tts.model.utils import seed_everything
 from f5_tts.cleantext.th_normalize import normalize_text
 from f5_tts.infer.infer_gradio import *
 
-
-
 #ถ้าอยากใช้โมเดลที่อัพเดทใหม หรือโมเดลภาษาอื่น สามารถแก้ไขโค้ด Model และ Vocab เช่น default_model_base = "hf://VIZINTZOR/F5-TTS-THAI/model_350000.pt"
 default_model_base = "hf://VIZINTZOR/F5-TTS-THAI/model_1000000.pt"
 v2_model_base = "hf://VIZINTZOR/F5-TTS-TH-v2/model_250000.pt"
@@ -548,6 +546,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
