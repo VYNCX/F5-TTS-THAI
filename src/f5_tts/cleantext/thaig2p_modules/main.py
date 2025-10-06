@@ -1,5 +1,4 @@
 import csv, os, html, re
-from pythainlp import word_tokenize
 from tltk import g2p as tltkg2p
 
 ##################################################
@@ -19,8 +18,6 @@ abs_dir = os.path.dirname(__file__)
 with open(abs_dir + '/thai2phone.csv', encoding="utf-8") as f:
     THAI2PHONE_DICT = dict(csv.reader(f))
     THAI2PHONE_DICT = {k:v for k,v in THAI2PHONE_DICT.items() if v != ''}
-with open(abs_dir + '/number2phone.csv') as f:
-    NUMBER2PHONE_DICT = dict(csv.reader(f))
 
 ##################################################
 ### UTILS FOR HANDLING PHONES
@@ -117,57 +114,8 @@ def is_time(text:str):
     # 8:00, 09.12, 12:12, 23.31น., etc
     return bool(re.match(r'[012]?[0-9][:\.][0-5][0-9](\s*)?(น.)?', text))
 
-def get_phone_time(time:str):
-    # 20.31 -> jI-3 sip2 nA-1 liʔ4 kA-1 sAm5 sip2 ʔet2 nA-1 TI-1
-    hour, minute = re.split(r'[:\.]', time) # 23.31น. -> [23, 31น.]
-    minute = minute.split('น.')[0] # 31น. -> 31
-    if minute == '00':
-        return get_phone_number(hour) + ' nA-1 li-4 kA-1' # 8.00 -> pYt2 nA-1 li-4 kA-1
-    else:
-        return get_phone_number(hour) + ' nA-1 li-4 kA-1 ' + get_phone_number(minute) + ' nA-1 TI-1'
-
 def is_number(text:str):
     return bool(re.match(r'\-?\d[\d\,]*(?:\.\d+)?$', text))
-
-def get_phone_number(number:str):
-    # 3,120 -> sAm5 Pan1 rXj4 jI-3 sip2
-    # 123.123 -> nɯŋ2 rXj4 jI-3 sip2 sAm5 cut2 nɯŋ2 sXŋ5 sAm5
-    number = str(number) # float 123.5 -> str "123.5"
-    if re.match(r'0[0-9]*[1-9]+', number): # e.g. 0012 (exclude 0, 00)
-        number = number.lstrip('0') # 0012 -> 12
-    number = number.replace(',', '') # 1,000 -> 1000
-    minus = number[0] == '-' # bool to check negative
-    number = number.strip('-') # delete initial -
-    if '.' not in number: # if integer
-        length = len(number)
-        if length <= 2:
-            if number in NUMBER2PHONE_DICT:
-                phone = NUMBER2PHONE_DICT[number]
-            else:
-                phone = NUMBER2PHONE_DICT[number[0]+'0'] + ' ' + NUMBER2PHONE_DICT[number[1]] # 34 -> 30 + 4
-        elif length <= 7: # 7 = million = ล้าน
-            if number in NUMBER2PHONE_DICT:
-                phone = NUMBER2PHONE_DICT[number]
-            else:
-                phone = NUMBER2PHONE_DICT[number[0]+'0'*(length-1)] + ' ' + get_phone_number(number[1:]) # 345 -> 300 + 45 (recursive)
-        elif length <= 12: # 12 = trillion = ล้านล้าน
-            # 123456000 -> 123 + ล้าน + 456000
-            upper = number[:-6]
-            lower = number[-6:] # xxx ล้าน
-            if lower == '000000':
-                phone = get_phone_number(upper) + ' lAn4'
-            else:
-                phone = get_phone_number(upper) + ' lAn4 ' + get_phone_number(lower)
-        else:
-            return number # longer than 12, return original
-    else: # if decimal
-        integer, decimal = number.split('.')
-        decimal = ' '.join([get_phone_number(x) for x in decimal]) # get one by one
-        phone = get_phone_number(integer) + ' cut2 ' + decimal
-    if minus:
-        return 'lop4 ' + phone
-    else:
-        return phone
 
 def get_phone_word_tltk(thaiword:str):
     # if the word is not in dict, use tltk instead
@@ -338,6 +286,7 @@ def g2p(sentence, transcription='haas', return_tokens=False, decoded=True):
 
     ### tokenize ###
     if type(sentence) == str: # input is string
+        from pythainlp import word_tokenize
         sentence = clean(sentence) # preprocessing
         tokens = word_tokenize(sentence, keep_whitespace=False)
     elif type(sentence) == list and type(sentence[0]) == str: # input is tokens already
@@ -371,14 +320,6 @@ def g2p(sentence, transcription='haas', return_tokens=False, decoded=True):
         elif re.match(r'[ก-๙][ก-๙\-\.]*$', token): 
             #phone = None  # return None, USE THIS LINE WHEN TEST
             phone = get_phone_word_tltk(token)
-        
-        # time e.g. 22.34 
-        elif is_time(token):
-            phone = get_phone_time(token)
-        
-        # number
-        elif is_number(token):
-            phone = get_phone_number(token)
         
         # return original token, e.g. english, punctuation...
         else: 

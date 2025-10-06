@@ -1,13 +1,13 @@
 import random
 import sys
-from importlib.resources import files
 import gradio as gr 
 import tempfile
 import torchaudio
 import soundfile as sf
 from cached_path import cached_path
 import argparse
-import os
+import torch
+from deep_translator import GoogleTranslator
 
 from f5_tts.infer.utils_infer import (
     infer_process,
@@ -16,14 +16,14 @@ from f5_tts.infer.utils_infer import (
     preprocess_ref_audio_text,
     remove_silence_for_generated_wav,
     save_spectrogram,
+    transcribe
 )
 from f5_tts.model import DiT
 from f5_tts.model.utils import seed_everything
-import torch
-from f5_tts.cleantext.number_tha import replace_numbers_with_thai
-from f5_tts.cleantext.th_repeat import process_thai_repeat
-from f5_tts.utils.whisper_api import translate_inference,transribe_inference
+from f5_tts.cleantext.th_normalize import normalize_text
 from f5_tts.infer.infer_gradio import *
+
+
 
 #ถ้าอยากใช้โมเดลที่อัพเดทใหม หรือโมเดลภาษาอื่น สามารถแก้ไขโค้ด Model และ Vocab เช่น default_model_base = "hf://VIZINTZOR/F5-TTS-THAI/model_350000.pt"
 default_model_base = "hf://VIZINTZOR/F5-TTS-THAI/model_1000000.pt"
@@ -103,7 +103,7 @@ def infer_tts(
     
     ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, ref_text)
     
-    gen_text_cleaned = process_thai_repeat(replace_numbers_with_thai(gen_text)) 
+    gen_text_cleaned = normalize_text(gen_text)
 
     final_wave, final_sample_rate, combined_spectrogram = infer_process(
         ref_audio,
@@ -134,13 +134,16 @@ def infer_tts(
     print("seed:", output_seed)
     return (final_sample_rate, final_wave), spectrogram_path, ref_text, output_seed 
 
-def transcribe_text(input_audio="",translate=False,model="large-v3-turbo",compute_type="float16",target_lg="th",source_lg='th'):
-    if translate:
-        output_text = translate_inference(text=transribe_inference(input_audio=input_audio,model=model,
-                                          compute_type=compute_type,language=source_lg),target=target_lg)
+def translate(text=str,target="th"):
+    translated = GoogleTranslator(source='auto', target=target).translate(text=text)
+    print("Translated Text:",translated)
+    return translated
+
+def transcribe_text(input_audio="",is_translate=False,target_lg="th",source_lg='th'):
+    if is_translate:
+        output_text = translate(text=transcribe(input_audio=input_audio,language=source_lg),target=target_lg)
     else:
-        output_text = transribe_inference(input_audio=input_audio,model=model,
-                                          compute_type=compute_type,language=source_lg)
+        output_text = transcribe(input_audio=input_audio,language=source_lg)
     return output_text
 
 def create_gradio_interface():
@@ -438,7 +441,7 @@ def create_gradio_interface():
                         return [None] + [speech_types[style]["ref_text"] for style in speech_types]
                     ref_text = speech_types[current_style].get("ref_text", "")
 
-                    ms_cleaned_text = process_thai_repeat(replace_numbers_with_thai(text))
+                    ms_cleaned_text = normalize_text(text)
                     # Generate speech for this segment
                     audio_out, _, ref_text_out = infer(
                         ref_audio, 
@@ -523,8 +526,6 @@ def create_gradio_interface():
                     generate_btn_stt = gr.Button("ถอดข้อความ",variant="primary")
 
                     with gr.Accordion(label="ตั้งค่า",open=False):
-                        model_wp = gr.Dropdown(label="Model",choices=['base','small','medium','large-v2','large-v3','large-v3-turbo'],value="large-v2")
-                        compute_type = gr.Dropdown(label="Compute Type",choices=["float32","float16","int8_float16","int8"],value="float16")
                         source_lg = gr.Dropdown(label="ภาษาต้นฉบับ",choices=["Auto",'th',"en"],value="Auto")
                         target_lg = gr.Dropdown(label="ภาษาที่แปล",choices=['th',"en"],value="th")
 
@@ -532,8 +533,7 @@ def create_gradio_interface():
                     output_ref_text = gr.Textbox(label="ข้อความต้นฉบับ",lines=3,show_copy_button=True)
             
             generate_btn_stt.click(fn=transcribe_text,
-                                   inputs=[ref_audio_input,is_translate,
-                                           model_wp,compute_type,target_lg,source_lg],
+                                   inputs=[ref_audio_input,is_translate,target_lg,source_lg],
                                    outputs=output_ref_text)
             
         return demo
