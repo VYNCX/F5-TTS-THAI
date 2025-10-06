@@ -93,7 +93,7 @@ def number2text(text):
     return process_text(text)
 
 def remove_symbol(text):
-    symbols = "{}[]()-_?/\\|!*%$&@#^<>+-\";:~\`=“”"
+    symbols = ",.{}[]()-_?/\\|!*%$&@#^<>+-\";:~\`=“”"
     for symbol in symbols:
         text = text.replace(symbol, '')
     text = text.replace(" ๆ","ๆ")
