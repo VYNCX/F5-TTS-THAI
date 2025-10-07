@@ -173,7 +173,7 @@ class DynamicBatchSampler(Sampler[list[int]]):
     """
 
     def __init__(
-        self, sampler: Sampler[int], frames_threshold: int, max_samples=0, random_seed=None, drop_last: bool = False
+        self, sampler: Sampler[int], frames_threshold: int, max_samples=0, random_seed=None, drop_residual: bool = False
     ):
         self.sampler = sampler
         self.frames_threshold = frames_threshold
@@ -208,11 +208,14 @@ class DynamicBatchSampler(Sampler[list[int]]):
                     batch = []
                     batch_frames = 0
 
-        if not drop_last and len(batch) > 0:
+        if not drop_residual and len(batch) > 0:
             batches.append(batch)
 
         del indices
         self.batches = batches
+
+        # Ensure even batches with accelerate BatchSamplerShard cls under frame_per_batch setting
+        self.drop_last = True
 
     def set_epoch(self, epoch: int) -> None:
         """Sets the epoch for this sampler."""
@@ -309,7 +312,7 @@ def collate_fn(batch):
     max_mel_length = mel_lengths.amax()
 
     padded_mel_specs = []
-    for spec in mel_specs:  # TODO. maybe records mask for attention here
+    for spec in mel_specs:
         padding = (0, max_mel_length - spec.size(-1))
         padded_spec = F.pad(spec, padding, value=0)
         padded_mel_specs.append(padded_spec)
@@ -321,7 +324,7 @@ def collate_fn(batch):
 
     return dict(
         mel=mel_specs,
-        mel_lengths=mel_lengths,
+        mel_lengths=mel_lengths,  # records for padding mask
         text=text,
         text_lengths=text_lengths,
     )
