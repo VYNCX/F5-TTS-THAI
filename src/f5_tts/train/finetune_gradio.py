@@ -1,36 +1,36 @@
-import threading
-import queue
-import re
-
 import gc
 import json
 import os
 import platform
-import psutil
+import queue
 import random
-import signal
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from glob import glob
+from importlib.resources import files
 
 import click
 import gradio as gr
 import librosa
 import numpy as np
+import psutil
 import torch
 import torchaudio
+from cached_path import cached_path
 from datasets import Dataset as Dataset_
 from datasets.arrow_writer import ArrowWriter
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from scipy.io import wavfile
-from cached_path import cached_path
+
 from f5_tts.api import F5TTS
-from f5_tts.model.utils import convert_char_to_pinyin
 from f5_tts.infer.utils_infer import transcribe
-from importlib.resources import files
+from f5_tts.model.utils import convert_char_to_pinyin
 
 
 training_process = None
@@ -42,8 +42,8 @@ last_device = ""
 last_ema = None
 
 
-path_data = str(files("f5_tts").joinpath("../../data"))
-path_project_ckpts = str(files("f5_tts").joinpath("../../ckpts"))
+path_data = "./data"
+path_project_ckpts = "./ckpts"
 file_train = str(files("f5_tts").joinpath("train/finetune_cli.py"))
 
 device = (
@@ -55,7 +55,6 @@ device = (
     if torch.backends.mps.is_available()
     else "cpu"
 )
-
 
 # Save settings from a JSON file
 def save_settings(
@@ -118,26 +117,28 @@ def load_settings(project_name):
 
     # Default settings
     default_settings = {
-        "exp_name": "F5TTS_Base",
-        "learning_rate": 1e-05,
-        "batch_size_per_gpu": 1000,
+        "exp_name": "F5TTS_v1_Base",
+        "learning_rate": 1e-5,
+        "batch_size_per_gpu": 3200,
         "batch_size_type": "frame",
         "max_samples": 64,
         "grad_accumulation_steps": 1,
-        "max_grad_norm": 1,
+        "max_grad_norm": 1.0,
         "epochs": 100,
-        "num_warmup_updates": 2,
-        "save_per_updates": 300,
+        "num_warmup_updates": 100,
+        "save_per_updates": 500,
         "keep_last_n_checkpoints": -1,
         "last_per_updates": 100,
         "finetune": True,
         "file_checkpoint_train": "",
         "tokenizer_type": "pinyin",
         "tokenizer_file": "",
-        "mixed_precision": "none",
-        "logger": "wandb",
+        "mixed_precision": "fp16",
+        "logger": "none",
         "bnb_optimizer": False,
     }
+    if device == "mps":
+        default_settings["mixed_precision"] = "none"
 
     # Load settings from file if it exists
     if os.path.isfile(file_setting):
@@ -176,50 +177,12 @@ def get_audio_duration(audio_path):
     return audio.shape[1] / sample_rate
 
 
-def clear_text(text):
-    """Clean and prepare text by lowering the case and stripping whitespace."""
-    return text.lower().strip()
-
-
-def get_rms(
-    y,
-    frame_length=2048,
-    hop_length=512,
-    pad_mode="constant",
-):  # https://github.com/RVC-Boss/GPT-SoVITS/blob/main/tools/slicer2.py
-    padding = (int(frame_length // 2), int(frame_length // 2))
-    y = np.pad(y, padding, mode=pad_mode)
-
-    axis = -1
-    # put our new within-frame axis at the end for now
-    out_strides = y.strides + tuple([y.strides[axis]])
-    # Reduce the shape on the framing axis
-    x_shape_trimmed = list(y.shape)
-    x_shape_trimmed[axis] -= frame_length - 1
-    out_shape = tuple(x_shape_trimmed) + tuple([frame_length])
-    xw = np.lib.stride_tricks.as_strided(y, shape=out_shape, strides=out_strides)
-    if axis < 0:
-        target_axis = axis - 1
-    else:
-        target_axis = axis + 1
-    xw = np.moveaxis(xw, -1, target_axis)
-    # Downsample along the target axis
-    slices = [slice(None)] * xw.ndim
-    slices[axis] = slice(0, None, hop_length)
-    x = xw[tuple(slices)]
-
-    # Calculate power
-    power = np.mean(np.abs(x) ** 2, axis=-2, keepdims=True)
-
-    return np.sqrt(power)
-
-
 class Slicer:  # https://github.com/RVC-Boss/GPT-SoVITS/blob/main/tools/slicer2.py
     def __init__(
         self,
         sr: int,
         threshold: float = -40.0,
-        min_length: int = 2000,
+        min_length: int = 20000,  # 20 seconds
         min_interval: int = 300,
         hop_size: int = 20,
         max_sil_kept: int = 2000,
@@ -250,7 +213,7 @@ class Slicer:  # https://github.com/RVC-Boss/GPT-SoVITS/blob/main/tools/slicer2.
             samples = waveform
         if samples.shape[0] <= self.min_length:
             return [waveform]
-        rms_list = get_rms(y=samples, frame_length=self.win_size, hop_length=self.hop_size).squeeze(0)
+        rms_list = librosa.feature.rms(y=samples, frame_length=self.win_size, hop_length=self.hop_size).squeeze(0)
         sil_tags = []
         silence_start = None
         clip_start = 0
@@ -304,8 +267,7 @@ class Slicer:  # https://github.com/RVC-Boss/GPT-SoVITS/blob/main/tools/slicer2.
             silence_end = min(total_frames, silence_start + self.max_sil_kept)
             pos = rms_list[silence_start : silence_end + 1].argmin() + silence_start
             sil_tags.append((pos, total_frames + 1))
-        # Apply and return slices.
-        ####音频+起始时间+终止时间
+        # Apply and return slices: [chunk, start, end]
         if len(sil_tags) == 0:
             return [[waveform, 0, int(total_frames * self.hop_size)]]
         else:
@@ -361,27 +323,27 @@ def terminate_process(pid):
 
 
 def start_training(
-    dataset_name="",
-    exp_name="F5TTS_Base",
-    learning_rate=1e-4,
-    batch_size_per_gpu=400,
-    batch_size_type="frame",
-    max_samples=64,
-    grad_accumulation_steps=1,
-    max_grad_norm=1.0,
-    epochs=11,
-    num_warmup_updates=200,
-    save_per_updates=400,
-    keep_last_n_checkpoints=-1,
-    last_per_updates=800,
-    finetune=True,
-    file_checkpoint_train="",
-    tokenizer_type="pinyin",
-    tokenizer_file="",
-    mixed_precision="fp16",
-    stream=False,
-    logger="wandb",
-    ch_8bit_adam=False,
+    dataset_name,
+    exp_name,
+    learning_rate,
+    batch_size_per_gpu,
+    batch_size_type,
+    max_samples,
+    grad_accumulation_steps,
+    max_grad_norm,
+    epochs,
+    num_warmup_updates,
+    save_per_updates,
+    keep_last_n_checkpoints,
+    last_per_updates,
+    finetune,
+    file_checkpoint_train,
+    tokenizer_type,
+    tokenizer_file,
+    mixed_precision,
+    stream,
+    logger,
+    ch_8bit_adam,
 ):
     global training_process, tts_api, stop_signal
 
@@ -432,7 +394,7 @@ def start_training(
         fp16 = ""
 
     cmd = (
-        f"accelerate launch {fp16} {file_train} --exp_name {exp_name}"
+        f'accelerate launch {fp16} "{file_train}" --exp_name {exp_name}'
         f" --learning_rate {learning_rate}"
         f" --batch_size_per_gpu {batch_size_per_gpu}"
         f" --batch_size_type {batch_size_type}"
@@ -451,14 +413,17 @@ def start_training(
         cmd += " --finetune"
 
     if file_checkpoint_train != "":
-        cmd += f" --pretrain {file_checkpoint_train}"
+        cmd += f' --pretrain "{file_checkpoint_train}"'
 
     if tokenizer_file != "":
         cmd += f" --tokenizer_path {tokenizer_file}"
 
     cmd += f" --tokenizer {tokenizer_type}"
 
-    cmd += f" --log_samples --logger {logger}"
+    if logger != "none":
+        cmd += f" --logger {logger}"
+
+    cmd += " --log_samples"
 
     if ch_8bit_adam:
         cmd += " --bnb_optimizer"
@@ -515,7 +480,7 @@ def start_training(
             training_process = subprocess.Popen(
                 cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=env
             )
-            yield "Training started...", gr.update(interactive=False), gr.update(interactive=True)
+            yield "Training started ...", gr.update(interactive=False), gr.update(interactive=True)
 
             stdout_queue = queue.Queue()
             stderr_queue = queue.Queue()
@@ -584,7 +549,11 @@ def start_training(
                             gr.update(interactive=True),
                         )
                     else:
-                        yield "Training complete!", gr.update(interactive=False), gr.update(interactive=True)
+                        yield (
+                            "Training complete or paused ...",
+                            gr.update(interactive=False),
+                            gr.update(interactive=True),
+                        )
                     break
 
                 # Small sleep to prevent CPU thrashing
@@ -598,9 +567,9 @@ def start_training(
         time.sleep(1)
 
         if training_process is None:
-            text_info = "train stop"
+            text_info = "Train stopped !"
         else:
-            text_info = "train complete !"
+            text_info = "Train complete at end !"
 
     except Exception as e:  # Catch all exceptions
         # Ensure that we reset the training process variable in case of an error
@@ -615,11 +584,11 @@ def stop_training():
     global training_process, stop_signal
 
     if training_process is None:
-        return "Train not run !", gr.update(interactive=True), gr.update(interactive=False)
+        return "Train not running !", gr.update(interactive=True), gr.update(interactive=False)
     terminate_process_tree(training_process.pid)
     # training_process = None
     stop_signal = True
-    return "train stop", gr.update(interactive=True), gr.update(interactive=False)
+    return "Train stopped !", gr.update(interactive=True), gr.update(interactive=False)
 
 
 def get_list_projects():
@@ -698,7 +667,7 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
 
             try:
                 text = transcribe(file_segment, language)
-                text = text.lower().strip().replace('"', "")
+                text = text.strip()
 
                 data += f"{name_segment}|{text}\n"
 
@@ -797,17 +766,17 @@ def create_metadata(name_project, ch_tokenizer, progress=gr.Progress()):
             print(f"Error processing {file_audio}: {e}")
             continue
 
-        if duration < 1 or duration > 25:
-            if duration > 25:
-                error_files.append([file_audio, "duration > 25 sec"])
+        if duration < 1 or duration > 30:
+            if duration > 30:
+                error_files.append([file_audio, "duration > 30 sec"])
             if duration < 1:
                 error_files.append([file_audio, "duration < 1 sec "])
             continue
         if len(text) < 3:
-            error_files.append([file_audio, "very small text len 3"])
+            error_files.append([file_audio, "very short text length 3"])
             continue
 
-        text = clear_text(text)
+        text = text.strip()
         text = convert_char_to_pinyin([text], polyphone=True)[0]
 
         audio_path_list.append(file_audio)
@@ -826,9 +795,10 @@ def create_metadata(name_project, ch_tokenizer, progress=gr.Progress()):
     min_second = round(min(duration_list), 2)
     max_second = round(max(duration_list), 2)
 
-    with ArrowWriter(path=file_raw, writer_batch_size=1) as writer:
+    with ArrowWriter(path=file_raw) as writer:
         for line in progress.tqdm(result, total=len(result), desc="prepare data"):
             writer.write(line)
+        writer.finalize()
 
     with open(file_duration, "w") as f:
         json.dump({"duration": duration_list}, f, ensure_ascii=False)
@@ -871,40 +841,37 @@ def check_user(value):
 
 def calculate_train(
     name_project,
+    epochs,
+    learning_rate,
+    batch_size_per_gpu,
     batch_size_type,
     max_samples,
-    learning_rate,
     num_warmup_updates,
-    save_per_updates,
-    last_per_updates,
     finetune,
 ):
     path_project = os.path.join(path_data, name_project)
-    file_duraction = os.path.join(path_project, "duration.json")
+    file_duration = os.path.join(path_project, "duration.json")
 
-    if not os.path.isfile(file_duraction):
+    hop_length = 256
+    sampling_rate = 24000
+
+    if not os.path.isfile(file_duration):
         return (
-            1000,
+            epochs,
+            learning_rate,
+            batch_size_per_gpu,
             max_samples,
             num_warmup_updates,
-            save_per_updates,
-            last_per_updates,
             "project not found !",
-            learning_rate,
         )
 
-    with open(file_duraction, "r") as file:
+    with open(file_duration, "r") as file:
         data = json.load(file)
 
     duration_list = data["duration"]
-    samples = len(duration_list)
-    hours = sum(duration_list) / 3600
-
-    # if torch.cuda.is_available():
-    # gpu_properties = torch.cuda.get_device_properties(0)
-    # total_memory = gpu_properties.total_memory / (1024**3)
-    # elif torch.backends.mps.is_available():
-    # total_memory = psutil.virtual_memory().available / (1024**3)
+    max_sample_length = max(duration_list) * sampling_rate / hop_length
+    total_samples = len(duration_list)
+    total_duration = sum(duration_list)
 
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
@@ -912,64 +879,39 @@ def calculate_train(
         for i in range(gpu_count):
             gpu_properties = torch.cuda.get_device_properties(i)
             total_memory += gpu_properties.total_memory / (1024**3)  # in GB
-
     elif torch.xpu.is_available():
         gpu_count = torch.xpu.device_count()
         total_memory = 0
         for i in range(gpu_count):
             gpu_properties = torch.xpu.get_device_properties(i)
             total_memory += gpu_properties.total_memory / (1024**3)
-
     elif torch.backends.mps.is_available():
         gpu_count = 1
         total_memory = psutil.virtual_memory().available / (1024**3)
 
+    avg_gpu_memory = total_memory / gpu_count
+
+    # rough estimate of batch size
     if batch_size_type == "frame":
-        batch = int(total_memory * 0.5)
-        batch = (lambda num: num + 1 if num % 2 != 0 else num)(batch)
-        batch_size_per_gpu = int(38400 / batch)
-    else:
-        batch_size_per_gpu = int(total_memory / 8)
-        batch_size_per_gpu = (lambda num: num + 1 if num % 2 != 0 else num)(batch_size_per_gpu)
-        batch = batch_size_per_gpu
+        batch_size_per_gpu = max(int(38400 * (avg_gpu_memory - 5) / 75), int(max_sample_length))
+    elif batch_size_type == "sample":
+        batch_size_per_gpu = int(200 / (total_duration / total_samples))
 
-    if batch_size_per_gpu <= 0:
-        batch_size_per_gpu = 1
+    if total_samples < 64:
+        max_samples = int(total_samples * 0.25)
 
-    if samples < 64:
-        max_samples = int(samples * 0.25)
-    else:
-        max_samples = 64
+    num_warmup_updates = max(num_warmup_updates, int(total_samples * 0.05))
 
-    num_warmup_updates = int(samples * 0.05)
-    save_per_updates = int(samples * 0.10)
-    last_per_updates = int(save_per_updates * 0.25)
+    # take 1.2M updates as the maximum
+    max_updates = 1200000
 
-    max_samples = (lambda num: num + 1 if num % 2 != 0 else num)(max_samples)
-    num_warmup_updates = (lambda num: num + 1 if num % 2 != 0 else num)(num_warmup_updates)
-    save_per_updates = (lambda num: num + 1 if num % 2 != 0 else num)(save_per_updates)
-    last_per_updates = (lambda num: num + 1 if num % 2 != 0 else num)(last_per_updates)
-    if last_per_updates <= 0:
-        last_per_updates = 2
+    if batch_size_type == "frame":
+        mini_batch_duration = batch_size_per_gpu * gpu_count * hop_length / sampling_rate
+        updates_per_epoch = total_duration / mini_batch_duration
+    elif batch_size_type == "sample":
+        updates_per_epoch = total_samples / batch_size_per_gpu / gpu_count
 
-    total_hours = hours
-    mel_hop_length = 256
-    mel_sampling_rate = 24000
-
-    # target
-    wanted_max_updates = 1000000
-
-    # train params
-    gpus = gpu_count
-    frames_per_gpu = batch_size_per_gpu  # 8 * 38400 = 307200
-    grad_accum = 1
-
-    # intermediate
-    mini_batch_frames = frames_per_gpu * grad_accum * gpus
-    mini_batch_hours = mini_batch_frames * mel_hop_length / mel_sampling_rate / 3600
-    updates_per_epoch = total_hours / mini_batch_hours
-    # steps_per_epoch = updates_per_epoch * grad_accum
-    epochs = wanted_max_updates / updates_per_epoch
+    epochs = int(max_updates / updates_per_epoch)
 
     if finetune:
         learning_rate = 1e-5
@@ -977,32 +919,32 @@ def calculate_train(
         learning_rate = 7.5e-5
 
     return (
+        epochs,
+        learning_rate,
         batch_size_per_gpu,
         max_samples,
         num_warmup_updates,
-        save_per_updates,
-        last_per_updates,
-        samples,
-        learning_rate,
-        int(epochs),
+        total_samples,
     )
 
 
-def extract_and_save_ema_model(checkpoint_path: str, new_checkpoint_path: str, safetensors: bool) -> str:
+def prune_checkpoint(checkpoint_path: str, new_checkpoint_path: str, save_ema: bool, safetensors: bool) -> str:
     try:
         checkpoint = torch.load(checkpoint_path, weights_only=True)
         print("Original Checkpoint Keys:", checkpoint.keys())
 
-        ema_model_state_dict = checkpoint.get("ema_model_state_dict", None)
-        if ema_model_state_dict is None:
-            return "No 'ema_model_state_dict' found in the checkpoint."
+        to_retain = "ema_model_state_dict" if save_ema else "model_state_dict"
+        try:
+            model_state_dict_to_retain = checkpoint[to_retain]
+        except KeyError:
+            return f"{to_retain} not found in the checkpoint."
 
         if safetensors:
             new_checkpoint_path = new_checkpoint_path.replace(".pt", ".safetensors")
-            save_file(ema_model_state_dict, new_checkpoint_path)
+            save_file(model_state_dict_to_retain, new_checkpoint_path)
         else:
             new_checkpoint_path = new_checkpoint_path.replace(".safetensors", ".pt")
-            new_checkpoint = {"ema_model_state_dict": ema_model_state_dict}
+            new_checkpoint = {"ema_model_state_dict": model_state_dict_to_retain}
             torch.save(new_checkpoint, new_checkpoint_path)
 
         return f"New checkpoint saved at: {new_checkpoint_path}"
@@ -1021,7 +963,11 @@ def expand_model_embeddings(ckpt_path, new_ckpt_path, num_new_tokens=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    if ckpt_path.endswith(".safetensors"):
+        ckpt = load_file(ckpt_path, device="cpu")
+        ckpt = {"ema_model_state_dict": ckpt}
+    elif ckpt_path.endswith(".pt"):
+        ckpt = torch.load(ckpt_path, map_location="cpu")
 
     ema_sd = ckpt.get("ema_model_state_dict", {})
     embed_key_ema = "ema_model.transformer.text_embed.text_embed.weight"
@@ -1039,7 +985,10 @@ def expand_model_embeddings(ckpt_path, new_ckpt_path, num_new_tokens=42):
 
     ema_sd[embed_key_ema] = expand_embeddings(ema_sd[embed_key_ema])
 
-    torch.save(ckpt, new_ckpt_path)
+    if new_ckpt_path.endswith(".safetensors"):
+        save_file(ema_sd, new_ckpt_path)
+    elif new_ckpt_path.endswith(".pt"):
+        torch.save(ckpt, new_ckpt_path)
 
     return vocab_new
 
@@ -1089,9 +1038,11 @@ def vocab_extend(project_name, symbols, model_type):
     with open(file_vocab_project, "w", encoding="utf-8") as f:
         f.write("\n".join(vocab))
 
-    if model_type == "F5-TTS":
-        ckpt_path = str(cached_path("hf://VIZINTZOR/F5-TTS-THAI/model_500000.pt"))
-    else:
+    if model_type == "F5TTS_v1_Base":
+        ckpt_path = str(cached_path("hf://SWivid/F5-TTS/F5TTS_v1_Base/model_1250000.safetensors"))
+    elif model_type == "F5TTS_Base":
+        ckpt_path = str(cached_path("hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.pt"))
+    elif model_type == "E2TTS_Base":
         ckpt_path = str(cached_path("hf://SWivid/E2-TTS/E2TTS_Base/model_1200000.pt"))
 
     vocab_size_new = len(miss_symbols)
@@ -1101,7 +1052,7 @@ def vocab_extend(project_name, symbols, model_type):
     os.makedirs(new_ckpt_path, exist_ok=True)
 
     # Add pretrained_ prefix to model when copying for consistency with finetune_cli.py
-    new_ckpt_file = os.path.join(new_ckpt_path, "pretrained_model_1200000.pt")
+    new_ckpt_file = os.path.join(new_ckpt_path, "pretrained_" + os.path.basename(ckpt_path))
 
     size = expand_model_embeddings(ckpt_path, new_ckpt_file, num_new_tokens=vocab_size_new)
 
@@ -1109,7 +1060,7 @@ def vocab_extend(project_name, symbols, model_type):
     return f"vocab old size : {size_vocab}\nvocab new size : {size}\nvocab add : {vocab_size_new}\nnew symbols :\n{vocab_new}"
 
 
-def vocab_check(project_name):
+def vocab_check(project_name, tokenizer_type):
     name_project = project_name
     path_project = os.path.join(path_data, name_project)
 
@@ -1137,7 +1088,9 @@ def vocab_check(project_name):
         if len(sp) != 2:
             continue
 
-        text = sp[1].lower().strip()
+        text = sp[1].strip()
+        if tokenizer_type == "pinyin":
+            text = convert_char_to_pinyin([text], polyphone=True)[0]
 
         for t in text:
             if t not in vocab and t not in miss_symbols_keep:
@@ -1149,7 +1102,7 @@ def vocab_check(project_name):
         info = "You can train using your language !"
     else:
         vocab_miss = ",".join(miss_symbols)
-        info = f"The following symbols are missing in your language {len(miss_symbols)}\n\n"
+        info = f"The following {len(miss_symbols)} symbols are missing in your language\n\n"
 
     return info, vocab_miss
 
@@ -1231,21 +1184,24 @@ def infer(
         vocab_file = os.path.join(path_data, project, "vocab.txt")
 
         tts_api = F5TTS(
-            model_type=exp_name, ckpt_file=file_checkpoint, vocab_file=vocab_file, device=device_test, use_ema=use_ema
+            model=exp_name, ckpt_file=file_checkpoint, vocab_file=vocab_file, device=device_test, use_ema=use_ema
         )
 
         print("update >> ", device_test, file_checkpoint, use_ema)
 
+    if seed == -1:  # -1 used for random
+        seed = None
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
         tts_api.infer(
-            gen_text=gen_text.lower().strip(),
-            ref_text=ref_text.lower().strip(),
             ref_file=ref_audio,
+            ref_text=ref_text.strip(),
+            gen_text=gen_text.strip(),
             nfe_step=nfe_step,
-            file_wave=f.name,
             speed=speed,
-            seed=seed,
             remove_silence=remove_silence,
+            file_wave=f.name,
+            seed=seed,
         )
         return f.name, tts_api.device, str(tts_api.seed)
 
@@ -1404,14 +1360,14 @@ def get_audio_select(file_sample):
 with gr.Blocks() as app:
     gr.Markdown(
         """
-# E2/F5 TTS Automatic Finetune
+# F5 TTS Automatic Finetune
 
-This is a local web UI for F5 TTS with advanced batch processing support. This app supports the following TTS models:
+This is a local web UI for F5 TTS finetuning support. This app supports the following TTS models:
 
 * [F5-TTS](https://arxiv.org/abs/2410.06885) (A Fairytaler that Fakes Fluent and Faithful Speech with Flow Matching)
 * [E2 TTS](https://arxiv.org/abs/2406.18009) (Embarrassingly Easy Fully Non-Autoregressive Zero-Shot TTS)
 
-The checkpoints support Thai.
+The pretrained checkpoints support English and Chinese.
 
 For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussions/143)
 """
@@ -1421,7 +1377,7 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
         projects, projects_selelect = get_list_projects()
         tokenizer_type = gr.Radio(label="ประเภท Tokenizer", choices=["pinyin", "char", "custom"], value="pinyin")
         project_name = gr.Textbox(label="ชื่อโปรเจกต์", value="my_speak")
-        bt_create = gr.Button("สร้างโปรเจกต์")
+        bt_create = gr.Button("สร้างโปรเจกต์ใหม่")
 
     with gr.Row():
         cm_project = gr.Dropdown(
@@ -1432,9 +1388,9 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
     bt_create.click(fn=create_data_project, inputs=[project_name, tokenizer_type], outputs=[cm_project])
 
     with gr.Tabs():
-        with gr.TabItem("ถอดข้อมูลเสียง"):
+        with gr.TabItem("1.ถอดข้อความเสียง"):
             gr.Markdown("""```plaintext 
-ข้ามขั้นตอนนี้หากคุณมีชุดข้อมูล metadata.csv และโฟลเดอร์ wavs ที่มีไฟล์เสียงทั้งหมด                 
+Skip ข้ามขั้นตอนนี้หากคุณมีชุดข้อมูล metadata.csv และโฟลเดอร์ wavs ที่มีไฟล์เสียงทั้งหมด                 
 ```""")
 
             ch_manual = gr.Checkbox(label="Audio from Path", value=False)
@@ -1453,10 +1409,10 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
                 visible=False,
             )
 
-            audio_speaker = gr.File(label="เสียงขาเข้า", type="filepath", file_count="multiple")
-            txt_lang = gr.Text(label="ภาษา", value="English")
-            bt_transcribe = bt_create = gr.Button("ถอดเสียง")
-            txt_info_transcribe = gr.Text(label="ข้อมูล", value="")
+            audio_speaker = gr.File(label="เสียง", type="filepath", file_count="multiple")
+            txt_lang = gr.Textbox(label="ภาษา", value="English")
+            bt_transcribe = bt_create = gr.Button("ถอดข้อความ")
+            txt_info_transcribe = gr.Textbox(label="ข้อมูล", value="")
             bt_transcribe.click(
                 fn=transcribe_all,
                 inputs=[cm_project, audio_speaker, txt_lang, ch_manual],
@@ -1467,7 +1423,7 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
             random_sample_transcribe = gr.Button("สุ่มเสียงตัวอย่าง")
 
             with gr.Row():
-                random_text_transcribe = gr.Text(label="ข้อความ")
+                random_text_transcribe = gr.Textbox(label="ข้อความ")
                 random_audio_transcribe = gr.Audio(label="เสียง", type="filepath")
 
             random_sample_transcribe.click(
@@ -1476,39 +1432,7 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
                 outputs=[random_text_transcribe, random_audio_transcribe],
             )
 
-        with gr.TabItem("ตรวจสอบ Vocab"):
-            gr.Markdown("""```plaintext 
-ตรวจสอบคำศัพท์สำหรับการปรับแต่ง Emilia_ZH_EN เพื่อให้แน่ใจว่ามีการรวมสัญลักษณ์ทั้งหมดไว้ สำหรับการปรับแต่งภาษาใหม่.
-```""")
-
-            check_button = gr.Button("ตรวจสอบ Vocab")
-            txt_info_check = gr.Text(label="ข้อมูล", value="")
-
-            gr.Markdown("""```plaintext 
-การใช้แบบจำลองขยายช่วยให้คุณปรับแต่งภาษาใหม่ที่ไม่มีสัญลักษณ์ในคำศัพท์ได้ การดำเนินการนี้จะสร้างแบบจำลองใหม่ที่มีขนาดคำศัพท์ใหม่และบันทึกไว้ในโฟลเดอร์ ckpts/project ของคุณ.
-```""")
-
-            exp_name_extend = gr.Radio(label="โมเดล", choices=["F5-TTS", "E2-TTS"], value="F5-TTS")
-
-            with gr.Row():
-                txt_extend = gr.Textbox(
-                    label="สัญลักษณ",
-                    value="",
-                    placeholder="หากต้องการเพิ่มสัญลักษณ์ใหม่ โปรดใช้ ',' สำหรับแต่ละสัญลักษณ์",
-                    scale=6,
-                )
-                txt_count_symbol = gr.Textbox(label="ขนาด Vocab ใหม่", value="", scale=1)
-
-            extend_button = gr.Button("เพิ่ม")
-            txt_info_extend = gr.Text(label="ข้อมูล", value="")
-
-            txt_extend.change(vocab_count, inputs=[txt_extend], outputs=[txt_count_symbol])
-            check_button.click(fn=vocab_check, inputs=[cm_project], outputs=[txt_info_check, txt_extend])
-            extend_button.click(
-                fn=vocab_extend, inputs=[cm_project, txt_extend, exp_name_extend], outputs=[txt_info_extend]
-            )
-
-        with gr.TabItem("เตรียมชุดข้อมูล"):
+        with gr.TabItem("2.เตรียมชุดข้อมูล"):
             gr.Markdown("""```plaintext 
 ข้ามขั้นตอนนี้หากคุณมีชุดข้อมูล raw.arrow, duration.json และ vocab.txt
 ```""")
@@ -1540,8 +1464,8 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
             ch_tokenizern = gr.Checkbox(label="สร้างคำศัพท์", value=False, visible=False)
 
             bt_prepare = bt_create = gr.Button("เตรียมข้อมูล")
-            txt_info_prepare = gr.Text(label="ข้อมูล", value="")
-            txt_vocab_prepare = gr.Text(label="คำศัพท์", value="")
+            txt_info_prepare = gr.Textbox(label="ข้อมูล", value="")
+            txt_vocab_prepare = gr.Textbox(label="คำศัพท์", value="")
 
             bt_prepare.click(
                 fn=create_metadata, inputs=[cm_project, ch_tokenizern], outputs=[txt_info_prepare, txt_vocab_prepare]
@@ -1550,14 +1474,14 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
             random_sample_prepare = gr.Button("สุ่มตัวอย่างเสียง")
 
             with gr.Row():
-                random_text_prepare = gr.Text(label="Tokenizer")
+                random_text_prepare = gr.Textbox(label="Tokenizer")
                 random_audio_prepare = gr.Audio(label="เสียง", type="filepath")
 
             random_sample_prepare.click(
                 fn=get_random_sample_prepare, inputs=[cm_project], outputs=[random_text_prepare, random_audio_prepare]
             )
 
-        with gr.TabItem("การฝึกอบรม"):
+        with gr.TabItem("3.ฝึกอบรม"):
             gr.Markdown("""```plaintext 
 การตั้งค่าอัตโนมัติยังอยู่ในช่วงทดลอง โปรดตรวจสอบให้แน่ใจว่าได้ตั้งค่า epoch, save per updates และ last per updates อย่างถูกต้อง หรือเปลี่ยนด้วยตนเองตามต้องการ
 หากคุณพบข้อผิดพลาดเกี่ยวกับหน่วยความจำ ให้ลองลดขนาดแบตช์ต่อ GPU เป็นจำนวนที่น้อยลง.
@@ -1567,48 +1491,63 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
 # batch_size_per_gpu = 3200 สำหรับ GPU 24GB
 ```""")
             with gr.Row():
+                exp_name = gr.Radio(label="โมเดล", choices=["F5TTS_Base", "F5TTS_V2_Base"])
+                tokenizer_file = gr.Textbox(label="ตำแหน่ง Vocab ไฟล์")
+                file_checkpoint_train = gr.Textbox(label="ตำแหน่ง Pretrained โมเดล")
+
+            with gr.Row():
+                ch_finetune = bt_create = gr.Checkbox(label="Finetune")
+                lb_samples = gr.Label(label="ตัวอย่าง")
                 bt_calculate = bt_create = gr.Button("ตั้งค่าอัตโนมัติ")
-                lb_samples = gr.Label(label="จำนวนเสียง")
-                batch_size_type = gr.Radio(label="Batch Size Type", choices=["frame", "sample"], value="frame")
 
             with gr.Row():
-                ch_finetune = bt_create = gr.Checkbox(label="Finetune", value=True)
-                tokenizer_file = gr.Textbox(label="ไฟล์ Tokenizer", value="")
-                file_checkpoint_train = gr.Textbox(label="ตำแหน่ง Pretrained Checkpoint", value="")
+                epochs = gr.Number(label="Epochs")
+                learning_rate = gr.Number(label="Learning Rate", step=0.5e-5)
+                max_grad_norm = gr.Number(label="Max Gradient Norm")
+                num_warmup_updates = gr.Number(label="Warmup Updates")
 
             with gr.Row():
-                exp_name = gr.Radio(label="ประเภทโมเดล", choices=["F5TTS_Base", "E2TTS_Base"], value="F5TTS_Base")
-                learning_rate = gr.Number(label="Learning Rate", value=1e-5, step=1e-5)
+                batch_size_type = gr.Radio(
+                    label="Batch Size Type",
+                    choices=["frame", "sample"],
+                    info="frame is calculated as seconds * sampling_rate / hop_length",
+                )
+                batch_size_per_gpu = gr.Number(label="Batch Size per GPU", info="N frames or N samples")
+                grad_accumulation_steps = gr.Number(
+                    label="Gradient Accumulation Steps", info="Effective batch size is multiplied by this value"
+                )
+                max_samples = gr.Number(label="Max Samples", info="Maximum number of samples per single GPU batch")
 
             with gr.Row():
-                batch_size_per_gpu = gr.Number(label="Batch Size per GPU", value=1000)
-                max_samples = gr.Number(label="Max Samples", value=64)
-
-            with gr.Row():
-                grad_accumulation_steps = gr.Number(label="Gradient Accumulation Steps", value=1)
-                max_grad_norm = gr.Number(label="Max Gradient Norm", value=1.0)
-
-            with gr.Row():
-                epochs = gr.Number(label="Epochs", value=10)
-                num_warmup_updates = gr.Number(label="Warmup Updates", value=2)
-
-            with gr.Row():
-                save_per_updates = gr.Number(label="Save per Updates", value=300)
+                save_per_updates = gr.Number(
+                    label="Save per Updates",
+                    info="Save intermediate checkpoints every N updates",
+                    minimum=10,
+                )
                 keep_last_n_checkpoints = gr.Number(
                     label="Keep Last N Checkpoints",
-                    value=-1,
                     step=1,
                     precision=0,
                     info="-1: เก็บจุดตรวจทั้งหมดไว้, 0: บันทึกเฉพาะ model_last.pt สุดท้าย, N>0: เก็บจุดตรวจ N จุดสุดท้ายไว้",
+                    minimum=-1,
                 )
-                last_per_updates = gr.Number(label="Last per Updates", value=100)
+                last_per_updates = gr.Number(
+                    label="Last per Updates",
+                    info="Save latest checkpoint with suffix _last.pt every N updates",
+                    minimum=10,
+                )
+                gr.Radio(label="")  # placeholder
 
             with gr.Row():
-                ch_8bit_adam = gr.Checkbox(label="Use 8-bit Adam optimizer")
-                mixed_precision = gr.Radio(label="mixed_precision", choices=["none", "fp16", "bf16"], value="none")
-                cd_logger = gr.Radio(label="logger", choices=["wandb", "tensorboard"], value="wandb")
-                start_button = gr.Button("เริ่มการฝึกอบรม")
-                stop_button = gr.Button("หยุดการฝึกอบรม", interactive=False)
+                ch_8bit_adam = gr.Checkbox(
+                    label="Use 8-bit Adam optimizer",
+                    info="(แนะนำ) เปิดใช้งานเพื่อฝึกโมเดลได้เร็วขึ้นและใช้ VRAM น้อยลง เหมาะสำหรับการฝึกบนการ์ดจอที่มีหน่วยความจำน้อย"
+                )
+                mixed_precision = gr.Radio(label="Mixed Precision", choices=["none", "fp16", "bf16"])
+                cd_logger = gr.Radio(label="Logger", choices=["none", "wandb", "tensorboard"])
+                with gr.Column():
+                    start_button = gr.Button("เริ่มฝึกอบรม")
+                    stop_button = gr.Button("หยุดฝึกอบรม", interactive=False)
 
             if projects_selelect is not None:
                 (
@@ -1655,7 +1594,7 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
                 ch_8bit_adam.value = bnb_optimizer_value
 
             ch_stream = gr.Checkbox(label="Stream Output Experiment", value=True)
-            txt_info_train = gr.Text(label="ข้อมูล", value="")
+            txt_info_train = gr.Textbox(label="Info", value="")
 
             list_audios, select_audio = get_audio_project(projects_selelect, False)
 
@@ -1670,17 +1609,17 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
                 ch_list_audio = gr.Dropdown(
                     choices=list_audios,
                     value=select_audio,
-                    label="เสียง",
+                    label="เสียงตัวอย่าง",
                     allow_custom_value=True,
                     scale=6,
                     interactive=True,
                 )
-                bt_stream_audio = gr.Button("รีเฟรช", scale=1)
+                bt_stream_audio = gr.Button("Refresh", scale=1)
                 bt_stream_audio.click(fn=get_audio_project, inputs=[cm_project], outputs=[ch_list_audio])
                 cm_project.change(fn=get_audio_project, inputs=[cm_project], outputs=[ch_list_audio])
 
             with gr.Row():
-                audio_ref_stream = gr.Audio(label="เสียงต้นฉบับ", type="filepath", value=select_audio_ref)
+                audio_ref_stream = gr.Audio(label="เสียงตันฉบับ", type="filepath", value=select_audio_ref)
                 audio_gen_stream = gr.Audio(label="เสียงที่สร้าง", type="filepath", value=select_audio_gen)
 
             ch_list_audio.change(
@@ -1722,23 +1661,21 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
                 fn=calculate_train,
                 inputs=[
                     cm_project,
+                    epochs,
+                    learning_rate,
+                    batch_size_per_gpu,
                     batch_size_type,
                     max_samples,
-                    learning_rate,
                     num_warmup_updates,
-                    save_per_updates,
-                    last_per_updates,
                     ch_finetune,
                 ],
                 outputs=[
+                    epochs,
+                    learning_rate,
                     batch_size_per_gpu,
                     max_samples,
                     num_warmup_updates,
-                    save_per_updates,
-                    last_per_updates,
                     lb_samples,
-                    learning_rate,
-                    epochs,
                 ],
             )
 
@@ -1748,25 +1685,25 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
 
             def setup_load_settings():
                 output_components = [
-                    exp_name,  # 1
-                    learning_rate,  # 2
-                    batch_size_per_gpu,  # 3
-                    batch_size_type,  # 4
-                    max_samples,  # 5
-                    grad_accumulation_steps,  # 6
-                    max_grad_norm,  # 7
-                    epochs,  # 8
-                    num_warmup_updates,  # 9
-                    save_per_updates,  # 10
-                    keep_last_n_checkpoints,  # 11
-                    last_per_updates,  # 12
-                    ch_finetune,  # 13
-                    file_checkpoint_train,  # 14
-                    tokenizer_type,  # 15
-                    tokenizer_file,  # 16
-                    mixed_precision,  # 17
-                    cd_logger,  # 18
-                    ch_8bit_adam,  # 19
+                    exp_name,
+                    learning_rate,
+                    batch_size_per_gpu,
+                    batch_size_type,
+                    max_samples,
+                    grad_accumulation_steps,
+                    max_grad_norm,
+                    epochs,
+                    num_warmup_updates,
+                    save_per_updates,
+                    keep_last_n_checkpoints,
+                    last_per_updates,
+                    ch_finetune,
+                    file_checkpoint_train,
+                    tokenizer_type,
+                    tokenizer_file,
+                    mixed_precision,
+                    cd_logger,
+                    ch_8bit_adam,
                 ]
                 return output_components
 
@@ -1784,27 +1721,31 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
                 outputs=outputs,
             )
 
-        with gr.TabItem("ทดสอบโมเดล"):
+        with gr.TabItem("4.ทดสอบโมเดล"):
             gr.Markdown("""```plaintext 
-SOS: ตรวจสอบการตั้งค่า use_ema (จริงหรือเท็จ) สำหรับรุ่นของคุณเพื่อดูว่าอะไรเหมาะกับคุณที่สุด แนะนำให้ปิด Use_EMA สำหรับข้อมูลที่ยังฝึกไม่มากเท่าไหร่ ใช้ค่า seed -1 จากสุ่ม
+ตรวจสอบการตั้งค่า use_ema (จริงหรือเท็จ) สำหรับรุ่นของคุณเพื่อดูว่าอะไรเหมาะกับคุณที่สุด แนะนำให้ปิด Use_EMA สำหรับข้อมูลที่ยังฝึกไม่มากเท่าไหร่ ใช้ค่า seed -1 เพื่อสุ่ม
 ```""")
-            exp_name = gr.Radio(label="โมเดล", choices=["F5-TTS", "E2-TTS"], value="F5-TTS")
+            exp_name = gr.Radio(
+                label="โมเดล", choices=["F5TTS_Base", "F5TTS_V2_Base"], value="F5TTS_Base"
+            )
             list_checkpoints, checkpoint_select = get_checkpoints_project(projects_selelect, False)
 
             with gr.Row():
                 nfe_step = gr.Number(label="NFE Step", value=32)
-                speed = gr.Slider(label="ความเร็ว", value=1.0, minimum=0.3, maximum=2.0, step=0.1)
-                seed = gr.Number(label="Seed", value=-1, minimum=-1)
+                speed = gr.Slider(label="ตวามเร็ว", value=1.0, minimum=0.3, maximum=2.0, step=0.1)
+                seed = gr.Number(label="สุ่ม Seed", value=-1, minimum=-1)
                 remove_silence = gr.Checkbox(label="Remove Silence")
 
-            ch_use_ema = gr.Checkbox(label="Use EMA", value=True)
             with gr.Row():
+                ch_use_ema = gr.Checkbox(
+                    label="ใช้ EMA", value=True, info="ปิดในช่วงแรกอาจให้ผลลัพธ์ที่ดีกว่า"
+                )
                 cm_checkpoint = gr.Dropdown(
                     choices=list_checkpoints, value=checkpoint_select, label="Checkpoints", allow_custom_value=True
                 )
                 bt_checkpoint_refresh = gr.Button("รีเฟรช")
 
-            random_sample_infer = gr.Button("สุ่มเสียงตัวอย่าง")
+            random_sample_infer = gr.Button("สุ่มตัวอย่าง")
 
             ref_text = gr.Textbox(label="ข้อความต้นฉบับ")
             ref_audio = gr.Audio(label="เสียงต้นฉบับ", type="filepath")
@@ -1815,11 +1756,11 @@ SOS: ตรวจสอบการตั้งค่า use_ema (จริง�
             )
 
             with gr.Row():
-                txt_info_gpu = gr.Textbox("", label="Device")
-                seed_info = gr.Text(label="Seed :")
-                check_button_infer = gr.Button("สร้าง")
+                txt_info_gpu = gr.Textbox("", label="Inference on Device :")
+                seed_info = gr.Textbox(label="Used Random Seed :")
+                check_button_infer = gr.Button("Inference")
 
-            gen_audio = gr.Audio(label="เสียงที่สร้าง", type="filepath")
+            gen_audio = gr.Audio(label="เสียงที่สร้างแล้ว", type="filepath")
 
             check_button_infer.click(
                 fn=infer,
@@ -1842,35 +1783,22 @@ SOS: ตรวจสอบการตั้งค่า use_ema (จริง�
             bt_checkpoint_refresh.click(fn=get_checkpoints_project, inputs=[cm_project], outputs=[cm_checkpoint])
             cm_project.change(fn=get_checkpoints_project, inputs=[cm_project], outputs=[cm_checkpoint])
 
-        with gr.TabItem("ลดขนาดโมเดล"):
+        with gr.TabItem("5.ลดขนาดโมเดล"):
             gr.Markdown("""```plaintext 
 ลดขนาดโมเดลจาก 5GB เหลือ 1.3GB จุดตรวจสอบใหม่สามารถใช้สำหรับการอนุมานหรือปรับแต่งในภายหลัง แต่ไม่สามารถใช้เพื่อฝึกอบรมต่อได้
 ```""")
-            txt_path_checkpoint = gr.Text(label="ตำแหน่ง Checkpoint หลัก:")
-            txt_path_checkpoint_small = gr.Text(label="ตำแหน่งโมเดลส่งออก:")
-            ch_safetensors = gr.Checkbox(label="Safetensors", value="")
-            txt_info_reduse = gr.Text(label="ข้อมูล", value="")
+            txt_path_checkpoint = gr.Textbox(label="ตำแหน่ง Checkpoint:")
+            txt_path_checkpoint_small = gr.Textbox(label="ตำแหน่งโมเดลขาออก:")
+            with gr.Row():
+                ch_save_ema = gr.Checkbox(label="บันทึกจุดตรวจ EMA", value=True)
+                ch_safetensors = gr.Checkbox(label="บันทึก safetensors ไฟล์", value=True)
+            txt_info_reduse = gr.Textbox(label="ข้อมูล", value="")
             reduse_button = gr.Button("ลดขนาดโมเดล")
             reduse_button.click(
-                fn=extract_and_save_ema_model,
-                inputs=[txt_path_checkpoint, txt_path_checkpoint_small, ch_safetensors],
+                fn=prune_checkpoint,
+                inputs=[txt_path_checkpoint, txt_path_checkpoint_small, ch_save_ema, ch_safetensors],
                 outputs=[txt_info_reduse],
             )
-
-        with gr.TabItem("ข้อมูลระบบ"):
-            output_box = gr.Textbox(label="ข้อมูล GPU and CPU", lines=20)
-
-            def update_stats():
-                return get_combined_stats()
-
-            update_button = gr.Button("อัปเดตสถิติ")
-            update_button.click(fn=update_stats, outputs=output_box)
-
-            def auto_update():
-                yield gr.update(value=update_stats())
-
-            gr.update(fn=auto_update, inputs=[], outputs=output_box)
-
 
 @click.command()
 @click.option("--port", "-p", default=None, type=int, help="Port to run the app on")
