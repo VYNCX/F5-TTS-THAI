@@ -6,9 +6,9 @@
 
 Text-to-Speech (TTS) ภาษาไทย — เครื่องมือสร้างเสียงพูดจากข้อความด้วยเทคนิค Flow Matching ด้วยโมเดล F5-TTS
 
-โมเดล Finetune : [VIZINTZOR/F5-TTS-THAI](https://huggingface.co/VIZINTZOR/F5-TTS-THAI) 
+โมเดล Finetune : [VIZINTZOR/F5-TTS-THAI](https://huggingface.co/VIZINTZOR/F5-TTS-THAI) เหมาะสำหรับการออกเสียงภาษาไทย
 
-โมเดล Finetune V2 (IPA) : [VIZINTZOR/F5-TTS-TH-V2](https://huggingface.co/VIZINTZOR/F5-TTS-TH-V2)
+โมเดล Finetune V2 (IPA) : [VIZINTZOR/F5-TTS-TH-V2](https://huggingface.co/VIZINTZOR/F5-TTS-TH-V2) ลดข้อผิดพลาดการอ่านข้ามคำหรือซ้ำคำ
 
  - การอ่านข้อความยาวๆ หรือบางคำ ยังไม่ถูกต้อง
 
@@ -16,6 +16,12 @@ Text-to-Speech (TTS) ภาษาไทย — เครื่องมือส
 ก่อนเริ่มใช้งาน ต้องติดตั้ง:
  - Python (แนะนำเวอร์ชัน 3.10 ขึ้นไป)
  - [CUDA](https://developer.nvidia.com/cuda-downloads) แนะนำ CUDA version 11.8
+
+สำหรับการใช้งานเท่านั้น
+```sh
+  pip install f5-tts-th
+```
+หรือ
 ```sh
 git clone https://github.com/VYNCX/F5-TTS-THAI.git
 cd F5-TTS-THAI
@@ -62,6 +68,7 @@ pip install torch==2.3.0+cu118 torchaudio==2.3.0+cu118 --extra-index-url https:/
 ติดตั้ง
 
 ```sh
+  git clone https://github.com/VYNCX/F5-TTS-THAI.git
   cd F5-TTS-THAI
   pip install -e .
 ```
@@ -91,6 +98,7 @@ https://github.com/user-attachments/assets/06d6e94b-5f83-4d69-99d1-ad19caa9792b
 # อ้างอิง
 
 - [F5-TTS](https://github.com/SWivid/F5-TTS)
+
 
 
 
