@@ -495,14 +495,17 @@ def infer_batch_process(
             duration = int(fix_duration * target_sample_rate / hop_length)
         else:
             if estimate_duration:
-                ref_len_rate = 4 / speed 
-                gen_len = int(len(gen_text_ipa) * ref_len_rate)
-
+                ref_len_rate = 4.5 / speed 
+                if use_ipa:
+                    gen_len = int(len(gen_text_ipa) * ref_len_rate)
+                else:
+                    gen_text_ipa = th_to_g2p(gen_text)
+                    gen_len = int(len(gen_text_ipa) * ref_len_rate)
+                    
                 if gen_len < 50:
                     gen_len = gen_len * 2
                 
-                gen_duration = (ref_audio_len + gen_len) / 100
-                duration = int(gen_duration * target_sample_rate / hop_length)
+                duration = ref_audio_len + gen_len
             else:
                 FRAMES_PER_WORDS = FRAMES_PER_SEC / 4
                 speech_rate = int(FRAMES_PER_WORDS / local_speed)
@@ -621,5 +624,6 @@ def save_spectrogram(spectrogram, path):
     plt.colorbar()
     plt.savefig(path)
     plt.close()
+
 
 
