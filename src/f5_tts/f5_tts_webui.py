@@ -25,7 +25,7 @@ from f5_tts.infer.infer_gradio import *
 
 #ถ้าอยากใช้โมเดลที่อัพเดทใหม หรือโมเดลภาษาอื่น สามารถแก้ไขโค้ด Model และ Vocab เช่น default_model_base = "hf://VIZINTZOR/F5-TTS-THAI/model_350000.pt"
 default_model_base = "hf://VIZINTZOR/F5-TTS-THAI/model_1000000.pt"
-v2_model_base = "hf://VIZINTZOR/F5-TTS-TH-v2/model_250000.pt"
+v2_model_base = "hf://VIZINTZOR/F5-TTS-TH-v2/model_350000.pt"
 vocab_base = "./vocab/vocab.txt"
 vocab_ipa_base = "./vocab/vocab_ipa.txt"
 
@@ -139,9 +139,9 @@ def translate(text=str,target="th"):
 
 def transcribe_text(input_audio="",is_translate=False,target_lg="th",source_lg='th'):
     if is_translate:
-        output_text = translate(text=transcribe(input_audio=input_audio,language=source_lg),target=target_lg)
+        output_text = translate(text=transcribe(input_audio, language=source_lg),target=target_lg)
     else:
-        output_text = transcribe(input_audio=input_audio,language=source_lg)
+        output_text = transcribe(input_audio, language=source_lg)
     return output_text
 
 def create_gradio_interface():
@@ -516,7 +516,7 @@ def create_gradio_interface():
             )
 
         with gr.Tab(label="Speech to Text"):
-            gr.Markdown("เปลี่ยนเสียงพูดเป็นข้อความด้วย โมเดล [Whisper](https://github.com/openai/whisper) โดยใช้ [faster-whisper](https://github.com/SYSTRAN/faster-whisper)")
+            gr.Markdown("เปลี่ยนเสียงพูดเป็นข้อความด้วย โมเดล [Whisper](https://github.com/openai/whisper)")
             with gr.Row():
                 with gr.Column():
                     ref_audio_input = gr.Audio(label="เสียงต้นฉบับ",type="filepath")
@@ -546,6 +546,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
