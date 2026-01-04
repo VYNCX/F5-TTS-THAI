@@ -139,9 +139,9 @@ def translate(text=str,target="th"):
 
 def transcribe_text(input_audio="",is_translate=False,target_lg="th",source_lg='th'):
     if is_translate:
-        output_text = translate(text=transcribe(input_audio=input_audio,language=source_lg),target=target_lg)
+        output_text = translate(text=transcribe(input_audio,language=source_lg),target=target_lg)
     else:
-        output_text = transcribe(input_audio=input_audio,language=source_lg)
+        output_text = transcribe(input_audio,language=source_lg)
     return output_text
 
 def create_gradio_interface():
